@@ -1,7 +1,7 @@
 """
-Self-contained study job. Fetches data.csv from raw GitHub, embeds with ESM-2,
-5-fold CV logistic on ESM-2 embeddings vs classical dipeptide composition, and
-POSTs the RESULT (or any error) to $WEBHOOK so it can be read without pod logs.
+Self-contained study job. Uses fair-esm (loads ESM-2 directly on torch, bypassing
+transformers' backend detection). Embeds 2000 IEDB peptides, 5-fold CV logistic on
+ESM-2 embeddings vs classical dipeptide composition, POSTs RESULT (or error) to $WEBHOOK.
 """
 import os, csv, io, json, urllib.request, traceback
 
@@ -14,12 +14,11 @@ def post(obj):
                 headers={"Content-Type": "application/json"}), timeout=30)
     except Exception as e:
         print("post failed", e, flush=True)
-    print("RESULT", json.dumps(obj), flush=True)
+    print("RESULT", json.dumps(obj)[:400], flush=True)
 
 try:
     post({"stage": "started"})
-    import numpy as np, torch
-    from transformers import AutoTokenizer, AutoModel
+    import numpy as np, torch, esm
     from sklearn.linear_model import LogisticRegression
     from sklearn.model_selection import StratifiedKFold
     from sklearn.metrics import roc_auc_score
@@ -30,6 +29,7 @@ try:
     for row in csv.DictReader(io.StringIO(raw)):
         seqs.append(row["seq"].upper()); ys.append(int(row["y"]))
     ys = np.array(ys)
+    post({"stage": "loaded", "n": len(seqs)})
 
     AA = "ACDEFGHIKLMNPQRSTVWY"; idx = {a+b: i for i, a in enumerate(AA) for b in AA}
     def dpc(s):
@@ -41,15 +41,18 @@ try:
     Xc = np.vstack([dpc(s) for s in seqs])
 
     dev = "cuda" if torch.cuda.is_available() else "cpu"
-    tok = AutoTokenizer.from_pretrained("facebook/esm2_t33_650M_UR50D")
-    model = AutoModel.from_pretrained("facebook/esm2_t33_650M_UR50D").to(dev).eval()
+    model, alphabet = esm.pretrained.esm2_t33_650M_UR50D()
+    model = model.eval().to(dev)
+    bc = alphabet.get_batch_converter()
     def embed(chunk):
-        enc = tok(chunk, return_tensors="pt", padding=True, truncation=True, max_length=64).to(dev)
+        data = [(str(i), s[:1022]) for i, s in enumerate(chunk)]
+        _, _, toks = bc(data); toks = toks.to(dev)
         with torch.no_grad():
-            rep = model(**enc).last_hidden_state
-        mask = enc["attention_mask"].unsqueeze(-1).float()
-        return ((rep*mask).sum(1)/mask.sum(1).clamp(min=1)).cpu().numpy()
+            reps = model(toks, repr_layers=[33])["representations"][33]
+        lens = (toks != alphabet.padding_idx).sum(1)
+        return np.vstack([reps[i, 1:lens[i]-1].mean(0).cpu().numpy() for i in range(len(chunk))])
     Xe = np.vstack([embed(seqs[i:i+16]) for i in range(0, len(seqs), 16)])
+    post({"stage": "embedded", "shape": list(Xe.shape)})
 
     def cv_auc(X):
         skf = StratifiedKFold(5, shuffle=True, random_state=0); a = []
@@ -60,7 +63,6 @@ try:
 
     ca, cs = cv_auc(Xc); ea, es = cv_auc(Xe)
     post({"stage": "done", "device": dev, "n": len(seqs), "pos": int(ys.sum()),
-          "classical_dpc_auroc": round(ca, 4), "classical_std": round(cs, 4),
-          "esm2_auroc": round(ea, 4), "esm2_std": round(es, 4), "delta": round(ea-ca, 4)})
+          "classical_dpc_auroc": round(ca, 4), "esm2_auroc": round(ea, 4), "delta": round(ea-ca, 4)})
 except Exception:
     post({"stage": "error", "traceback": traceback.format_exc()[-1500:]})
