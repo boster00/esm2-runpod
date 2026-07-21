@@ -28,3 +28,19 @@ jobs:
           tags: |
             ghcr.io/boster00/esm2-runpod:latest
             ghcr.io/boster00/esm2-runpod:${{ github.sha }}
+
+      - name: Make package public
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            try {
+              await github.rest.packages.updatePackageForAuthenticatedUser({
+                package_type: 'container',
+                package_name: 'esm2-runpod',
+                visibility: 'public'
+              });
+              console.log('Package made public');
+            } catch (e) {
+              console.log('Could not set visibility:', e.message);
+            }
