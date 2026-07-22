@@ -150,6 +150,72 @@ def upload_to_supabase(local_path, remote_name):
     return json.loads(resp.read())
 
 
+def upload_bytes(data, remote_name, content_type="application/octet-stream"):
+    """Upload raw bytes to Supabase Storage (upsert)."""
+    url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{remote_name}"
+    req = urllib.request.Request(
+        url, data=data, method="POST",
+        headers={
+            "apikey": SUPABASE_KEY,
+            "Authorization": f"Bearer {SUPABASE_KEY}",
+            "Content-Type": content_type,
+            "x-upsert": "true",
+        }
+    )
+    urllib.request.urlopen(req, timeout=120)
+
+
+def download_partial(remote_name="partial.jsonl.gz"):
+    """Download the resumable partial; return (list_of_recs, set_of_done_gene_ids).
+    Returns ([], set()) if none exists yet (fresh run)."""
+    url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{remote_name}"
+    req = urllib.request.Request(
+        url, headers={"apikey": SUPABASE_KEY,
+                      "Authorization": f"Bearer {SUPABASE_KEY}"})
+    try:
+        raw = urllib.request.urlopen(req, timeout=120).read()
+    except urllib.error.HTTPError as e:
+        if e.code in (400, 404):
+            return [], set()
+        raise
+    try:
+        text = gzip.decompress(raw).decode("utf-8")
+    except Exception as ex:
+        LOG(f"  partial decode warn ({ex}); starting fresh")
+        return [], set()
+    recs, done = [], set()
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            r = json.loads(line)
+        except Exception:
+            continue
+        recs.append(r)
+        done.add(r["gene_id"])
+    return recs, done
+
+
+def flush_checkpoint(recs, total, remote_name="partial.jsonl.gz"):
+    """Serialize all recs to gzip + upload as the resumable partial, and
+    write a progress.json the local orchestrator can poll for live %."""
+    buf = io.BytesIO()
+    with gzip.GzipFile(fileobj=buf, mode="wb") as gz:
+        for r in recs:
+            gz.write((json.dumps(r) + "\n").encode("utf-8"))
+    upload_bytes(buf.getvalue(), remote_name)
+    prog = {
+        "scored": len(recs),
+        "total": total,
+        "pct": round(100.0 * len(recs) / total, 2) if total else 0,
+        "ts": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "status": "scoring",
+    }
+    upload_bytes(json.dumps(prog).encode("utf-8"), "progress.json",
+                 content_type="application/json")
+
+
 def upsert_status(record):
     """Upsert a row into plm_precompute_status (create if needed)."""
     # Try to create the table if it doesn't exist via a simple insert
@@ -307,34 +373,56 @@ def main():
     t_clf = time.time() - t0
     LOG(f"Setup complete in {t_clf:.0f}s")
 
-    # Step 4: score all proteins
+    # Step 4: score all proteins (resumable + live progress)
     LOG("\n=== Scoring proteins ===")
-    scored = 0
+    FLUSH_EVERY = 500
+    recs, done = download_partial()
+    if done:
+        LOG(f"  RESUME: {len(done)} proteins already scored in partial; skipping them.")
+    scored = len(recs)
+    since_flush = 0
+    for prot in all_proteins:
+        if prot["gene_id"] in done:
+            continue
+        seq = prot["sequence"]
+        score_str = score_protein(seq, clf, model, alphabet, bc, device)
+        recs.append({
+            "gene_id": prot["gene_id"],
+            "symbol":  prot["symbol"],
+            "species": prot["species"],
+            "length":  len(seq),
+            "scores":  score_str,
+        })
+        scored += 1
+        since_flush += 1
+        if since_flush >= FLUSH_EVERY:
+            since_flush = 0
+            elapsed = time.time() - t0
+            rate = scored / elapsed if elapsed else 0
+            eta = (total_proteins - scored) / rate if rate else 0
+            LOG(f"  {scored}/{total_proteins} proteins "
+                f"({elapsed:.0f}s elapsed, ETA {eta:.0f}s)")
+            try:
+                flush_checkpoint(recs, total_proteins)
+            except Exception as e:
+                LOG(f"  checkpoint flush warn: {e}")
+
+    # Final checkpoint flush so partial == complete before finalize
+    try:
+        flush_checkpoint(recs, total_proteins)
+    except Exception as e:
+        LOG(f"  final checkpoint warn: {e}")
+
+    # Write the local final file from the in-memory recs
     with gzip.open(LOCAL_OUT, "wt", encoding="utf-8") as fh:
-        for prot in all_proteins:
-            seq = prot["sequence"]
-            score_str = score_protein(seq, clf, model, alphabet, bc, device)
-            rec = {
-                "gene_id": prot["gene_id"],
-                "symbol":  prot["symbol"],
-                "species": prot["species"],
-                "length":  len(seq),
-                "scores":  score_str,
-            }
-            fh.write(json.dumps(rec) + "\n")
-            scored += 1
-            if scored % 500 == 0:
-                elapsed = time.time() - t0
-                rate = scored / elapsed
-                eta = (total_proteins - scored) / rate if rate else 0
-                LOG(f"  {scored}/{total_proteins} proteins "
-                    f"({elapsed:.0f}s elapsed, ETA {eta:.0f}s)")
+        for r in recs:
+            fh.write(json.dumps(r) + "\n")
 
     elapsed_total = time.time() - t0
     LOG(f"\nAll {scored} proteins scored in {elapsed_total:.0f}s "
         f"({elapsed_total/3600:.2f}h)")
 
-    # Step 5: upload to Supabase Storage
+    # Step 5: upload to Supabase Storage (final, immutable, timestamped)
     LOG("\n=== Uploading to Supabase Storage ===")
     ts = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
     remote_name = f"scores_{ts}.jsonl.gz"
@@ -413,6 +501,14 @@ def main():
     status = {"status": "complete", "scored": scored, "remote_name": remote_name,
               "date": manifest["date"]}
     upsert_status(status)
+    try:
+        upload_bytes(json.dumps({
+            "scored": scored, "total": total_proteins, "pct": 100.0,
+            "ts": manifest["date"], "status": "complete",
+            "remote_name": remote_name,
+        }).encode("utf-8"), "progress.json", content_type="application/json")
+    except Exception as e:
+        LOG(f"  final progress warn: {e}")
     LOG("\nDONE.", json.dumps(status))
 
 
