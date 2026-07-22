@@ -337,6 +337,19 @@ def main():
     t0 = time.time()
     LOG(f"=== PLM Proteome Precompute — {datetime.utcnow().isoformat()}Z ===")
 
+    # Boot beacon: prove the entrypoint actually executes THIS script (RunPod
+    # on-demand pod stdout is not API-accessible; absence of this beacon a minute
+    # after boot means the container command never ran the workload).
+    try:
+        upload_bytes(json.dumps({
+            "status": "booted", "scored": 0, "total": None, "pct": 0,
+            "ts": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "sb_url_set": bool(SUPABASE_URL), "sb_key_set": bool(SUPABASE_KEY),
+        }).encode("utf-8"), "progress.json", content_type="application/json")
+        LOG("Boot beacon written to storage.")
+    except Exception as e:
+        LOG(f"  boot beacon warn: {e}")
+
     # Step 1: install deps
     LOG("Installing dependencies …")
     import subprocess
