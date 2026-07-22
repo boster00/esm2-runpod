@@ -327,7 +327,19 @@ def score_protein(seq, clf, model, alphabet, bc, device):
             start = end - CHUNK_OVERLAP
         probs = probs_sum / np.maximum(probs_cnt, 1)
 
-    scores = np.clip((probs * 10).astype(int), 0, 9)
+    # Per-protein normalization → 0-9 (see engineering_decisions.md 2026-07-22b).
+    # The raw ESM-2+LR probability saturates near 1.0 for ~93% of proteome residues,
+    # so an absolute `prob*10` track is a nearly-flat line pinned at 9 (useless).
+    # Encode each protein's RELATIVE epitope landscape instead: robust per-protein
+    # min-max (2nd–98th percentile) → 0-9, surfacing hotspots vs valleys for antigen
+    # design. Trade-off: digits are within-protein relative, not cross-protein absolute.
+    lo = float(np.percentile(probs, 2))
+    hi = float(np.percentile(probs, 98))
+    if hi - lo < 1e-9:
+        scores = np.full(L, 4, dtype=int)  # degenerate/flat protein → neutral mid
+    else:
+        scaled = (probs - lo) / (hi - lo)
+        scores = np.clip(scaled * 9.999, 0, 9).astype(int)
     return "".join(map(str, scores.tolist()))
 
 

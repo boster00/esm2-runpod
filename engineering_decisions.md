@@ -1,5 +1,29 @@
 # Engineering Decisions — esm2-runpod
 
+## 2026-07-22b · plm digit = PER-PROTEIN relative epitope quality, NOT absolute prob×10
+
+**Decision:** `score_protein` maps each protein's per-residue probabilities to 0-9 via
+**robust per-protein min-max** (2nd–98th percentile → 0-9), not `clip(prob*10)`.
+
+**Rejected alternative (the original):** `scores = clip(prob*10, 0, 9)` — absolute
+probability × 10. Also rejected: global/cross-protein normalization.
+
+**Why:** measured across a 1,600-protein / 909K-residue sample, the raw ESM-2+LR
+probability saturates — **92.9% of all residues mapped to digit 9**, giving a nearly-flat
+track pinned at max (the user's report: "most scores are 100, not useful"). The classifier
+still discriminates (~0.81 AUROC on balanced epitope peptides), so the *relative ordering
+within a protein* is informative even though absolute probs cluster high. Global
+normalization does NOT fix this — most proteins are genuinely mostly-high, so they'd still
+read as saturated; only PER-PROTEIN normalization spreads every protein's line and surfaces
+its internal hotspots, which is what the antigen-design "Scoring" histogram needs.
+
+**Consequence if violated:** revert to `prob*10` → the purple PLM line flatlines at ~+100
+for ~93% of positions and conveys no per-residue signal. **Also:** because only the clipped
+0-9 digit is stored (not the raw prob), any future re-mapping requires a full re-embed/
+re-score — the spread cannot be recovered from stored digits.
+
+
+
 ## 2026-07-22 · run_proteome_plm.py writes a resumable partial + progress.json to storage every 500 proteins
 
 **Decision:** during the scoring loop, every 500 proteins we (a) re-upload the full
