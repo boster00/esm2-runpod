@@ -350,11 +350,20 @@ def main():
     except Exception as e:
         LOG(f"  boot beacon warn: {e}")
 
-    # Step 1: install deps
-    LOG("Installing dependencies …")
-    import subprocess
-    subprocess.run([sys.executable, "-m", "pip", "install", "--quiet",
-                   "fair-esm", "scikit-learn", "numpy"], check=True)
+    # Step 1: deps are baked into the image; only pip-install if missing, and
+    # NEVER let a no-egress secure pod crash here (they're already present).
+    try:
+        import esm  # noqa: F401
+        import sklearn  # noqa: F401
+        LOG("Dependencies already present (baked image).")
+    except Exception:
+        LOG("Installing dependencies …")
+        import subprocess
+        try:
+            subprocess.run([sys.executable, "-m", "pip", "install", "--quiet",
+                           "fair-esm", "scikit-learn", "numpy"], check=False)
+        except Exception as e:
+            LOG(f"  pip warn: {e}")
 
     # Step 2: fetch + dedup
     LOG("\n=== Fetching sequences from Supabase ===")
