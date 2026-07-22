@@ -5,11 +5,8 @@ WORKDIR /app
 RUN pip install --no-cache-dir runpod transformers scikit-learn numpy
 COPY handler.py .
 COPY data.csv .
-# Pre-download ESM-2 650M model weights so workers start immediately (no cold-start latency)
-RUN python3 -c "\
-from transformers import AutoTokenizer, AutoModel; \
-tok = AutoTokenizer.from_pretrained('facebook/esm2_t33_650M_UR50D'); \
-m = AutoModel.from_pretrained('facebook/esm2_t33_650M_UR50D'); \
-print('ESM-2 650M cached OK, hidden_size:', m.config.hidden_size); \
-"
+# Pre-download ESM-2 650M model weights using huggingface_hub (no GPU needed at build time)
+# snapshot_download fetches the raw files into HF cache without instantiating the model,
+# so it works even though GitHub Actions runners have no GPU / CUDA.
+RUN python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='facebook/esm2_t33_650M_UR50D'); print('ESM-2 650M weights cached OK')"
 CMD ["python", "-u", "handler.py"]
