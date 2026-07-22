@@ -327,19 +327,19 @@ def score_protein(seq, clf, model, alphabet, bc, device):
             start = end - CHUNK_OVERLAP
         probs = probs_sum / np.maximum(probs_cnt, 1)
 
-    # Per-protein normalization → 0-9 (see engineering_decisions.md 2026-07-22b).
+    # Per-protein PERCENTILE-RANK normalization → 0-9 (see ED 2026-07-22b).
     # The raw ESM-2+LR probability saturates near 1.0 for ~93% of proteome residues,
-    # so an absolute `prob*10` track is a nearly-flat line pinned at 9 (useless).
-    # Encode each protein's RELATIVE epitope landscape instead: robust per-protein
-    # min-max (2nd–98th percentile) → 0-9, surfacing hotspots vs valleys for antigen
-    # design. Trade-off: digits are within-protein relative, not cross-protein absolute.
-    lo = float(np.percentile(probs, 2))
-    hi = float(np.percentile(probs, 98))
-    if hi - lo < 1e-9:
-        scores = np.full(L, 4, dtype=int)  # degenerate/flat protein → neutral mid
-    else:
-        scaled = (probs - lo) / (hi - lo)
-        scores = np.clip(scaled * 9.999, 0, 9).astype(int)
+    # AND the within-protein distribution is itself right-skewed (min-max still left
+    # ~82% at digit 9). Rank normalization forces an even spread by construction,
+    # regardless of skew: each residue's digit = its rank among this protein's residues.
+    # This is exactly "which positions are the relatively best epitopes in THIS protein"
+    # — what the antigen-design histogram needs. Trade-off: within-protein relative,
+    # uniform by construction (loses cross-protein + absolute magnitude).
+    order = np.argsort(probs, kind="stable")
+    ranks = np.empty(L, dtype=np.float64)
+    ranks[order] = np.arange(L)
+    pct = ranks / max(L - 1, 1)  # 0..1 by rank
+    scores = np.clip(pct * 9.999, 0, 9).astype(int)
     return "".join(map(str, scores.tolist()))
 
 

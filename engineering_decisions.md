@@ -3,10 +3,15 @@
 ## 2026-07-22b · plm digit = PER-PROTEIN relative epitope quality, NOT absolute prob×10
 
 **Decision:** `score_protein` maps each protein's per-residue probabilities to 0-9 via
-**robust per-protein min-max** (2nd–98th percentile → 0-9), not `clip(prob*10)`.
+**per-protein PERCENTILE-RANK** (each residue's rank among the protein's residues → 0-9),
+not `clip(prob*10)`.
 
-**Rejected alternative (the original):** `scores = clip(prob*10, 0, 9)` — absolute
-probability × 10. Also rejected: global/cross-protein normalization.
+**Rejected alternatives:** (1) `clip(prob*10)` — absolute probability × 10 (the original);
+(2) global/cross-protein normalization; (3) **per-protein min-max (2nd–98th pct)** — tried
+first, but the within-protein prob distribution is itself right-skewed so it still left
+**~82% of residues at digit 9** (measured on a 1,000-protein re-score). Rank normalization
+forces an even 0-9 spread by construction regardless of distribution shape, which is the
+only thing that reliably de-saturates the track.
 
 **Why:** measured across a 1,600-protein / 909K-residue sample, the raw ESM-2+LR
 probability saturates — **92.9% of all residues mapped to digit 9**, giving a nearly-flat
